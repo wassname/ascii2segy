@@ -46,7 +46,7 @@ pip install git+git://github.com/sixty-north/segpy/tree/91562fddfd6d8424ee4161f4
 In a command propmt with python64 3.3 install and test:
 ```
 pip install -r requirements.txt
-python ascii2segy ./test_data/test_input.tsv
+python ascii2segy.py ./test_data/test_input.tsv
 ```
 
 License
@@ -74,6 +74,8 @@ import sys
 import argparse
 import numpy as np
 import datetime
+import pylab
+from pylab import plt
 #import collections
 import pandas as pd
 
@@ -99,7 +101,7 @@ parser = argparse.ArgumentParser(
     epilog=__doc__.split('\n\n\n')[-1])
 parser.add_argument('infile', type=str, help='Input ascii velovity file in western (velf) format.')
 parser.add_argument('-o', '--outfile', type=str, default=None, help='Optional output segy filename, e.g. outfile.sgy. Defaults to infile.sgy. (default: %(default)s)') # default is same as input with different suffix
-parser.add_argument('-s', '--sample-rate', type=int, default=None, help='If not provided this is autodetected from input data. The velocities are resampled to this rate in milliseconds. (default: %(default)s)') # seem to need to be below 32.768ms
+parser.add_argument('-s', '--sample-rate', type=int, default=None, help='If not provided this is autodetected from input data. The velocities are resampled to this rate in milliseconds. Must be <=32.767 (so it can be stored int16 is microseconds) (default: %(default)s)') # seem to need to be below 32.768ms
 parser.add_argument('-m', '--max-time', type=float, default=None, help='If not provided this is autodetected from input data. The maximum time of the segy in ms. (default: %(default)s)') # max time
 parser.add_argument('--dtype', default=1, type=int, help="Datatype for segy {8: 'int8', 1: 'ibm', 2: 'int32', 3: 'int16', 5: 'float32'}") # run tests?
 parser.add_argument('-d', '--seismic-dimensions', type=int, default=3, help='Type of seismic, options 2 or 3.  (default: %(default)s)') 
@@ -191,11 +193,12 @@ def read_tsv_file(f):
 
 
 print ("Reading and sorting ascii file: {}".format(args.infile))
-datar,header=read_tsv_file(args.infile)
-data=pd.DataFrame(datar,columns=['x','y','t','v','inline','xline']) 
 if not os.path.isfile(args.infile):
     print ("Error Input file not found!")
     exit(0)
+datar,header=read_tsv_file(args.infile)
+data=pd.DataFrame(datar,columns=['x','y','t','v','inline','xline']) 
+
     
 #==============================================================================
 # Process the data
@@ -208,23 +211,95 @@ data=data.sort_index(by=['inline','xline','t'])
 trace_times=data.t
 trace_vels=data.v
 
+
 # make one unique index from inline and crossline, call it itrace
 # so 10970 and 31000 becomes 10970*10^5+31000=1097031000
 zeros_in_max_xline=int(np.ceil(np.log10(data.xline.max())))
-data['itrace']=data.inline*10**zeros_in_max_xline+data.xline
+data['itrace']=data.inline.multiply(10**zeros_in_max_xline)+data.xline
+metadata=data.groupby(data.itrace).first() # one row for each trace
 
 
-inlines=np.unique(data.inline.values)
-xlines=np.unique(data.xline.values)
 time_diffs=data.groupby(data.itrace).t.diff().dropna() # group by trace, for times get the difference, and drop NotANumbers
 vel_diffs=data.groupby(data.itrace).v.diff().dropna()
 traces=data.itrace.unique()
 trace_lengths=data.itrace.groupby(data.itrace).count()
 
 
+def angles(line):
+    """get angles between points in line"""
+    x=line[:,0]
+    y=line[:,1]
+    ang=np.arctan2(np.diff(x),np.diff(y))
+    ang2=np.unwrap(ang)
+    return np.array(ang2)
+
+class grid(object):
+    ''' init a seismic grid then use to convert between x,y and inline xline'''
+    def __init__(self,p0,irot,ibin,xbin):
+        '''
+        p0, is a point in the array with attributes:
+            p0.x, p0.y, p0.inline, p0.xline
+        irot, is the inline rotation in radians
+        ibin is the inline spacing 
+        xbin is the xline spacing
+        '''
+        self.irot=irot
+        self.ibin=ibin
+        self.xbin=xbin
+        self.inline=p0.inline
+        self.xline=p0.xline
+        self.x=p0.x
+        self.y=p0.y
+    
+    def ix2xy(self,inline,xline):
+        x=self.x+xbin*(xline-self.xline)*np.sin(self.irot)+ibin*(inline-self.inline)*np.cos(self.irot)
+        y=self.y+xbin*(xline-self.xline)*np.cos(self.irot)-ibin*(inline-self.inline)*np.sin(self.irot)
+        return  x,y
+        
+    def xy2ix(self,x,y):
+        raise("Not implemented")
+    
+
+# lets work out the whole inline xline grid
+inlines_r=pd.Series(data.inline.unique()) # inlines raw
+xlines_r=pd.Series(data.xline.unique())
+inline_int=inlines_r.diff().mode().values # choose interval as most common inline step, should I use min but ignore zero and nan?
+xline_int=xlines_r.diff().mode().values
+inlines=np.arange(inlines_r.min(),inlines_r.max(),inline_int)
+xlines=np.arange(xlines_r.min(),xlines_r.max(),xline_int)
+
+# find inline and xline with most data
+xline_lens=metadata.xline.groupby(metadata.xline).count()
+longest_xline_n=xline_lens.argmax()
+longest_xline=metadata[metadata.xline==longest_xline_n]
+inline_lens=metadata.inline.groupby(metadata.inline).count()
+longest_inline_n=inline_lens.argmax()
+longest_inline=metadata[metadata.inline==longest_inline_n]
+
+if args.seismic_dimensions==3:
+    # work out bins spacing
+    ibins=pylab.distances_along_curve(longest_xline[['x','y']])/longest_xline.inline.diff().iloc[1:]
+    ibin=ibins.mean()
+    xbins=pylab.distances_along_curve(longest_inline[['x','y']])/longest_inline.xline.diff().iloc[1:]
+    xbin=xbins.mean()
+     
+    inline_angs=angles(longest_inline[['x','y']].values)
+    inline_rot=inline_angs.mean()
+    xline_angs=angles(longest_xline[['x','y']].values)
+    xline_rot=xline_angs.mean()
+
+    pi=metadata.iloc[0] # reference point, might not be origin as we don't have that yet
+    pj=metadata.iloc[100] # use this for a test
+    gd=grid(pi,inline_rot,ibin,xbin)
+    x,y=gd.ix2xy(pj.inline,pj.xline)
+    
+    # check the predicted coords are right withing a meter
+    np.testing.assert_allclose(pj.x,x,atol=1) 
+    np.testing.assert_allclose(pj.y,y,atol=1)
+
+
 if args.test:
     # Some visual QC's
-    from pylab import plt
     plt.subplot(221)
     plt.title("Inline vs trace")
     plt.plot(data.inline)
@@ -303,6 +378,10 @@ if not args.outfile:
 if args.sample_rate==None:
     # work out if maxtime and samplesrate
     args.sample_rate=time_diffs[time_diffs!=0].mode()[0]
+    if  args.sample_rate>=32.767:
+        print("Sample rate can't be bigger than 32767, changed from {} to 32767".format(args.sample_rate))
+        args.sample_rate=32.767
+
     print ("No sample rate provided, using mode of: {}".format(args.sample_rate))
 
 if args.max_time==None:
@@ -365,8 +444,6 @@ template_binary_reel_header=segpy.binary_reel_header.BinaryReelHeader()
 print ("Writing segy {}".format(args.outfile))
 with open(args.outfile,'wb') as fo:
     
-
-
     # Format text header
     if args.use_extended_header: 
         print ("Formating extended textual header")
@@ -376,14 +453,14 @@ with open(args.outfile,'wb') as fo:
     
     #Format binary header
     binary_reel_header=template_binary_reel_header
-    binary_reel_header.sample_interval=int(args.sample_rate)#*1000) # samples length microseconds    
+    binary_reel_header.sample_interval=int(args.sample_rate*1000) # samples length microseconds    
     binary_reel_header.num_samples=len(itimes) # number of samples
     binary_reel_header.data_traces_per_ensemble=0 # len(data) # also must be # not sure how to work this out, maybe I need to scan the file first or after insert it
     binary_reel_header.auxiliary_traces_per_ensemble=0
     binary_reel_header.trace_sorting=4 # http://oivdoc91.vsg3d.com/APIS/RefManCpp/struct_so_v_r_segy_file_header.html#a612dab3b4d9c671ba6554a8fb4a88057
     binary_reel_header.format_revision_num=256 # 0 or 1 TODO move to 1
     binary_reel_header.data_sample_format=args.dtype # see binary header def.py file as it changes by revision. 1 is always ibm float
-    binary_reel_header.num_extended_textual_headers=len(extended_textual_header) # see binary header def.py file as it changes by revision. 1 is always ibm float
+    if args.use_extended_header: binary_reel_header.num_extended_textual_headers=len(extended_textual_header) # see binary header def.py file as it changes by revision. 1 is always ibm float
     
     # Write headers
     toolkit.write_textual_reel_header(fo, textual_reel_header, segyencoding)
@@ -392,19 +469,39 @@ with open(args.outfile,'wb') as fo:
     
     # Pre-Format trace headerf
     trace_header_format = toolkit.make_header_packer(segpy.trace_header.TraceHeaderRev1,endian)
+        
+    if args.seismic_dimensions==3:
+        # either iterate over the grid for 3d
+        xxlines,iinlines=np.meshgrid(xlines,inlines)
+        trace_iter=np.vstack([iinlines.flat,xxlines.flat]).T
+    else:
+        # or for 2d just iterate over cdp an sp
+        trace_iter=np.vstack([inlines_r,xlines_r]).T
     
     i=0
     tracen=1
-    for itrace,trace in data.groupby(data.itrace):
+    for inline,xline in trace_iter:
         i+=1
-        x,y,_,_,inline,xline,_ = trace.iloc[0].values.T
+        if ((metadata.inline==inline)*(metadata.xline==xline)).any():
+            trace=data[(data.inline==inline) * (data.xline==xline)]   
+            metatrace=metadata[(metadata.inline==inline) * (metadata.xline==xline)]  
+            x=metatrace.x
+            y=metatrace.y
+            times=trace.t.values
+            vels=trace.v.values
+        elif args.seismic_dimensions==3:
+            x,y=gd.ix2xy(inline,xline)
+            times=itimes
+            vels=np.zeros(itimes.shape)
+        else:
+            print("inline/xline or cdp/sp not found",inline,xline)
+        
         cdp=inline
         sp=xline
-        times=trace.t.values
-        vels=trace.v.values
+            
         
         if i%1000==0:
-            print ("Writing trace: {: 8.0f}/{}, {: 6.2f}%".format(i,len(traces),(1.0*i/len(traces))*100))
+            print ("Writing trace: {: 8.0f}/{}, {: 6.2f}%".format(i,len(trace_iter),(1.0*i/len(trace_iter))*100))
         
         if len(vels)==0:
             print ("Error no vels on trace", i)
@@ -442,7 +539,7 @@ with open(args.outfile,'wb') as fo:
         toolkit.write_trace_samples(fo, samples=samples, seg_y_type=SEG_Y_TYPE, endian=endian, pos=None)
         
         tracen+=1
-    print ("Writing trace: {: 8.0f}/{}, {: 6.2f}%".format(i,len(traces),(1.0*i/len(traces))*100))
+    print ("Writing trace: {: 8.0f}/{}, {: 6.2f}%".format(i,len(trace_iter),(1.0*i/len(trace_iter))*100))
     print( "Done")
     if not fo.closed: fo.close()
 

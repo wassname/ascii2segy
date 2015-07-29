@@ -1,4 +1,7 @@
-usage: ascii2segy_segpy.py [-h] [-o OUTFILE] [-s SAMPLE_RATE] [-m MAX_TIME]
+ascii2segy
+--
+
+usage: ascii2segy.py [-h] [-o OUTFILE] [-s SAMPLE_RATE] [-m MAX_TIME]
                            [--dtype DTYPE] [-d SEISMIC_DIMENSIONS] [-e]
                            [-v VERBOSITY] [-t]
                            infile
@@ -49,7 +52,7 @@ pip install git+git://github.com/sixty-north/segpy/tree/91562fddfd6d8424ee4161f4
 In a command propmt with python64 3.3 install and test:
 ```
 pip install -r requirements.txt
-python ascii2segy ./test_data/test_input.tsv
+python ascii2segy.py ./test_data/test_input.tsv
 ```
 
 License
